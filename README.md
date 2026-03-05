@@ -196,6 +196,16 @@ All key settings can now be configured through the `.env` file or within `main.p
 
 4. **Find your results** in the `output/` folder
 
+### Optional GUI Launcher
+
+Run the desktop launcher (Windows):
+
+```bash
+python launcher_gui.py
+```
+
+The launcher allows batch selection, resize mode/profile selection, and saves a session log in `output/`.
+
 ## Customization
 
 ### Font Configuration
@@ -222,6 +232,13 @@ All key settings can now be configured through the `.env` file:
 | `TRANSCRIPTION_MODEL` | medium | Whisper model to use (tiny, base, small, medium, large-v1, large-v2) |
 | `ASPECT_RATIO_WIDTH` | 9 | Width for aspect ratio (used with height for video resizing) |
 | `ASPECT_RATIO_HEIGHT` | 16 | Height for aspect ratio (used with width for video resizing) |
+| `RESIZE_MODE` | auto | Resize strategy: auto, ai, local_ai, ffmpeg |
+| `MAX_CLIPS_OVERRIDE` | 0 | If >0, disables interactive clip-count prompt |
+| `QUIET_MODE` | true | Reduce noisy third-party logs |
+| `SHOW_TITLE_PROMPT` | false | Print full Groq title prompt to console |
+| `NLTK_AUTO_DOWNLOAD` | false | Auto-download NLTK punkt resources if missing |
+| `FFMPEG_EXE` | (empty) | Absolute path to ffmpeg executable (optional override) |
+| `FFPROBE_EXE` | (empty) | Absolute path to ffprobe executable (optional override) |
 
 ### Engagement Scoring
 
@@ -242,6 +259,13 @@ pip install clipsai
 **"FFmpeg not found"**
 - Ensure FFmpeg is installed and in your system PATH
 - Restart your terminal after installation
+- On Windows, set explicit paths in `.env`:
+  - `FFMPEG_EXE=C:\ffmpeg\bin\ffmpeg.exe`
+  - `FFPROBE_EXE=C:\ffmpeg\bin\ffprobe.exe`
+
+**"ClipFinder failed ... client has been closed"**
+- Usually means model download is blocked/unavailable
+- The script now falls back to offline clip selection from transcript timing
 
 **"CUDA out of memory"**
 - Use a smaller transcription model

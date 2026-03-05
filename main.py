@@ -5,13 +5,34 @@ import pickle
 import subprocess
 import sys
 import string
+import tempfile
+import contextlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import nltk
-from clipsai import Transcriber, ClipFinder, resize, MediaEditor, AudioVideoFile
-from clipsai.clip.clip import Clip
 from dotenv import load_dotenv
+import huggingface_hub
+from resize_strategies import resize_with_strategy, configure_ffmpeg
+
+# Ensure unicode output works in Windows terminal (titles may include emojis).
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+# Compatibility shim for libraries still passing use_auth_token.
+_orig_hf_hub_download = huggingface_hub.hf_hub_download
+def _hf_hub_download_compat(*args, **kwargs):
+    if "use_auth_token" in kwargs and "token" not in kwargs:
+        kwargs["token"] = kwargs.pop("use_auth_token")
+    return _orig_hf_hub_download(*args, **kwargs)
+huggingface_hub.hf_hub_download = _hf_hub_download_compat
+try:
+    import huggingface_hub.file_download as _hf_fd
+    _hf_fd.hf_hub_download = _hf_hub_download_compat
+except Exception:
+    pass
 
 # Suppress unnecessary warnings
 import warnings
@@ -26,20 +47,65 @@ warnings.filterwarnings("ignore", message="torchaudio._backend.list_audio_backen
 # Suppress unnecessary warnings via environment variables
 os.environ['FFREPORT'] = 'file=ffmpeg.log:level=32'
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+os.environ['HF_HUB_DISABLE_PROGRESS_BARS'] = '1'
+os.environ['TRANSFORMERS_VERBOSITY'] = 'error'
+os.environ['TQDM_DISABLE'] = '1'
 
 # Load environment variables
 load_dotenv()
+FFMPEG_EXE, FFPROBE_EXE = configure_ffmpeg()
+NLTK_AUTO_DOWNLOAD = os.getenv("NLTK_AUTO_DOWNLOAD", "false").lower() == "true"
 
-# Download required NLTK data
-nltk.download('punkt')
+# Some third-party libraries call nltk.download() unconditionally.
+# In offline runs this creates noisy network errors, so disable by default.
+_orig_nltk_download = nltk.download
+def _safe_nltk_download(*args, **kwargs):
+    if not NLTK_AUTO_DOWNLOAD:
+        return False
+    kwargs.setdefault("quiet", True)
+    try:
+        return _orig_nltk_download(*args, **kwargs)
+    except Exception:
+        return False
+nltk.download = _safe_nltk_download
+
+from clipsai import Transcriber, ClipFinder
+from clipsai.clip.clip import Clip
+
+def ensure_nltk_data(resource: str) -> None:
+    """Ensure NLTK resource exists; optional quiet download if missing."""
+    try:
+        nltk.data.find(f"tokenizers/{resource}")
+        return
+    except LookupError:
+        pass
+    if not NLTK_AUTO_DOWNLOAD:
+        print(f"Warning: NLTK resource '{resource}' not found. Set NLTK_AUTO_DOWNLOAD=true to fetch it.")
+        return
+    try:
+        nltk.download(resource, quiet=True)
+    except Exception:
+        print(f"Warning: NLTK resource '{resource}' is not available.")
+
+
+ensure_nltk_data("punkt")
+ensure_nltk_data("punkt_tab")
+if not FFMPEG_EXE or not FFPROBE_EXE:
+    print(
+        "Warning: ffmpeg/ffprobe not found. Set FFMPEG_EXE and FFPROBE_EXE in .env "
+        "or install ffmpeg in PATH. Video trim/resize may fail."
+    )
 
 # --- Directories ---
-INPUT_DIR = "input"
-OUTPUT_DIR = "output"
+INPUT_DIR = os.getenv("INPUT_DIR", "input")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "output")
 FONT_DIR = "fonts" 
 
 # --- Hugging Face ---
 HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "your_huggingface_token_here")
+if HUGGINGFACE_TOKEN and HUGGINGFACE_TOKEN != "your_huggingface_token_here":
+    # Some libraries read HF_TOKEN instead of custom variable names.
+    os.environ["HF_TOKEN"] = HUGGINGFACE_TOKEN
 
 # --- Clip Duration ---
 MIN_CLIP_DURATION = int(os.getenv("MIN_CLIP_DURATION", "45"))
@@ -47,13 +113,25 @@ MAX_CLIP_DURATION = int(os.getenv("MAX_CLIP_DURATION", "120"))
 
 # --- Transcription ---
 TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "large-v1")
+MAX_CLIPS_OVERRIDE = int(os.getenv("MAX_CLIPS_OVERRIDE", "0"))
 
 # --- Resizing ---
 ASPECT_RATIO_WIDTH = int(os.getenv("ASPECT_RATIO_WIDTH", "9"))
 ASPECT_RATIO_HEIGHT = int(os.getenv("ASPECT_RATIO_HEIGHT", "16"))
+RESIZE_MODE = os.getenv("RESIZE_MODE", "auto")
 
 # --- Groq API ---
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
+AI_RESIZE_ALLOWED = True
+SHOW_TITLE_PROMPT = os.getenv("SHOW_TITLE_PROMPT", "true").lower() == "true"
+QUIET_MODE = os.getenv("QUIET_MODE", "true").lower() == "true"
+TITLE_PROMPT_TEMPLATE = os.getenv(
+    "TITLE_PROMPT_TEMPLATE",
+    "Given the following transcript, generate a catchy, viral YouTube Shorts title (max 7 words). "
+    "ALWAYS include an emoji in the title. ONLY output the title, nothing else. Do NOT use hashtags. "
+    "Do NOT explain, do NOT repeat the prompt, do NOT add quotes. The title should be in the style of these examples: "
+    "{examples}.\n\nTranscript:\n{transcript}"
+)
 
 # --- Subtitles ---
 SUBTITLE_FONT = "Montserrat Extra Bold"
@@ -165,6 +243,15 @@ def safe_filename(s: str) -> str:
     return ''.join(c for c in s if c in valid_chars)
 
 
+def run_quietly(func, *args, **kwargs):
+    """Run noisy third-party calls with suppressed stdout/stderr in quiet mode."""
+    if not QUIET_MODE:
+        return func(*args, **kwargs)
+    with open(os.devnull, "w", encoding="utf-8") as devnull:
+        with contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
+            return func(*args, **kwargs)
+
+
 def get_font_path(font_name: str) -> str:
     """Get the path to a font file in the font directory."""
     # Try different extensions for the font file
@@ -181,7 +268,7 @@ def transcribe_with_progress(audio_file_path, transcriber):
     
     # Get video duration for progress calculation
     try:
-        probe_cmd = ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', audio_file_path]
+        probe_cmd = [FFPROBE_EXE, '-v', 'quiet', '-show_entries', 'format=duration', '-of', 'csv=p=0', audio_file_path]
         duration = float(subprocess.check_output(probe_cmd).decode().strip())
         print(f"Video duration: {duration:.2f} seconds")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
@@ -199,9 +286,94 @@ def transcribe_with_progress(audio_file_path, transcriber):
     # For now, we'll use a simple approach since clipsai doesn't expose progress directly
     # You can enhance this by modifying the clipsai library or using a different approach
     print("Starting transcription (progress updates may be limited)...")
-    transcription = transcriber.transcribe(audio_file_path=audio_file_path, iso6391_lang_code='en')
+    temp_wav_path = None
+    try:
+        # Fail fast when a video has no audio stream.
+        probe_audio_cmd = [
+            FFPROBE_EXE, "-v", "error",
+            "-select_streams", "a",
+            "-show_entries", "stream=index",
+            "-of", "csv=p=0",
+            audio_file_path,
+        ]
+        audio_streams = subprocess.check_output(probe_audio_cmd, text=True).strip()
+        if not audio_streams:
+            print("No audio stream found in the video. Skipping this video.")
+            return None
+
+        # Work around clipsai/whisperx mp4 handling issues by forcing a wav input.
+        fd, temp_wav_path = tempfile.mkstemp(suffix=".wav")
+        os.close(fd)
+        extract_cmd = [
+            FFMPEG_EXE, "-y", "-i", audio_file_path,
+            "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
+            temp_wav_path
+        ]
+        subprocess.run(extract_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        transcription = run_quietly(
+            transcriber.transcribe,
+            audio_file_path=temp_wav_path,
+            iso6391_lang_code='en',
+        )
+    except IndexError:
+        # whisperx may raise IndexError when VAD returns no speech segments.
+        print("No active speech detected. Skipping this video.")
+        return None
+    except Exception as e:
+        print(f"Transcription failed: {e}")
+        return None
+    finally:
+        if temp_wav_path and os.path.exists(temp_wav_path):
+            try:
+                os.remove(temp_wav_path)
+            except Exception:
+                pass
     print("Transcription completed!")
     return transcription
+
+
+def trim_video_ffmpeg(
+    input_path: str,
+    output_path: str,
+    start_time: float,
+    end_time: float,
+) -> bool:
+    """Trim clip with ffmpeg instead of clipsai MediaEditor."""
+    duration = max(0.0, end_time - start_time)
+    if duration <= 0:
+        return False
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-ss",
+        f"{start_time:.3f}",
+        "-i",
+        input_path,
+        "-t",
+        f"{duration:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-c:a",
+        "aac",
+        output_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        print(
+            "Trim failed: ffmpeg executable not found. "
+            "Configure FFMPEG_EXE/FFPROBE_EXE or install ffmpeg in PATH."
+        )
+        return False
+    except Exception:
+        return False
+
 
 def create_animated_subtitles(video_path, transcription, clip, output_path):
     """
@@ -210,11 +382,15 @@ def create_animated_subtitles(video_path, transcription, clip, output_path):
     print('Creating styled subtitles...')
     
     # Get word info for the clip
-    word_info = [w for w in transcription.get_word_info() if w["start_time"] >= clip.start_time and w["end_time"] <= clip.end_time]
+    # Keep words that overlap clip boundaries to avoid losing words at clip edges.
+    word_info = [
+        w for w in transcription.get_word_info()
+        if w["end_time"] > clip.start_time and w["start_time"] < clip.end_time
+    ]
     if not word_info:
         print('No word-level transcript found for the clip. Skipping subtitles.')
         return video_path
-    
+
     # Build cues: group words into phrases of max 25 chars
     cues = []
     current_cue = {
@@ -225,8 +401,8 @@ def create_animated_subtitles(video_path, transcription, clip, output_path):
     
     for w in word_info:
         word = w["word"]
-        start_time = w["start_time"] - clip.start_time
-        end_time = w["end_time"] - clip.start_time  # Fixed: should be clip.start_time, not clip.end_time
+        start_time = max(0.0, w["start_time"] - clip.start_time)
+        end_time = min(clip.end_time - clip.start_time, w["end_time"] - clip.start_time)
         
         should_start_new = False
         if current_cue['start_time'] is None:
@@ -299,9 +475,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{line}\n")
     
     final_output = output_path.replace('.mp4', '_with_subtitles.mp4')
+    # ffmpeg ass filter on Windows needs escaped drive colon and forward slashes.
+    ass_file_filter_path = ass_file.replace("\\", "/").replace(":", "\\:")
     ffmpeg_cmd = [
-        'ffmpeg', '-i', video_path,
-        '-vf', f"ass={ass_file}",
+        FFMPEG_EXE, '-i', video_path,
+        '-vf', f"ass=filename='{ass_file_filter_path}'",
         '-c:a', 'copy',
         '-y',
         final_output
@@ -324,12 +502,13 @@ def get_viral_title(transcript_text, groq_api_key):
         "She was almost dead 😵", "He made $1,000,000 in 1 hour 💸", "This changed everything... 😲", 
         "They couldn't believe what happened! 😱", "He risked it all for this 😬"
     ]
-    prompt = (
-        "Given the following transcript, generate a catchy, viral YouTube Shorts title (max 7 words). "
-        "ALWAYS include an emoji in the title. ONLY output the title, nothing else. Do NOT use hashtags. "
-        "Do NOT explain, do NOT repeat the prompt, do NOT add quotes. The title should be in the style of these examples: "
-        + ", ".join(examples) + ".\n\nTranscript:\n" + transcript_text
+    prompt = TITLE_PROMPT_TEMPLATE.format(
+        examples=", ".join(examples),
+        transcript=transcript_text
     )
+    if SHOW_TITLE_PROMPT:
+        print("\n[Title Prompt]")
+        print(prompt[:1200] + ("..." if len(prompt) > 1200 else ""))
     headers = {
         'Authorization': f'Bearer {groq_api_key}',
         'Content-Type': 'application/json',
@@ -401,6 +580,49 @@ def calculate_engagement_score(clip, transcription):
     
     return engagement_score
 
+
+def fallback_find_clips_from_words(
+    transcription,
+    min_duration: int,
+    max_duration: int,
+    max_candidates: int = 12,
+) -> List[Clip]:
+    """Offline-safe fallback clip builder using transcript word timing."""
+    words = transcription.get_word_info() or []
+    words = [w for w in words if "start_time" in w and "end_time" in w]
+    if not words:
+        return []
+    words.sort(key=lambda w: w["start_time"])
+
+    target = max(min_duration, min(max_duration, 65))
+    clips: List[Clip] = []
+    i = 0
+    n = len(words)
+    while i < n and len(clips) < max_candidates:
+        start = float(words[i]["start_time"])
+        min_end = start + min_duration
+        target_end = start + target
+        max_end = start + max_duration
+
+        end = None
+        j = i
+        while j < n and float(words[j]["end_time"]) <= max_end:
+            cur_end = float(words[j]["end_time"])
+            if cur_end >= min_end:
+                end = cur_end
+                if cur_end >= target_end:
+                    break
+            j += 1
+
+        if end is not None and end > start:
+            clips.append(Clip(start_time=start, end_time=end, start_char=0, end_char=0))
+            # Move forward to avoid creating highly overlapping clips.
+            while i < n and float(words[i]["start_time"]) < start + (target * 0.6):
+                i += 1
+        else:
+            i += 1
+    return clips
+
 # Find all mp4 files in the input directory
 input_files = [f for f in os.listdir(INPUT_DIR) if f.endswith('.mp4')]
 if not input_files:
@@ -448,21 +670,27 @@ else:
 video_max_clips = {}
 clip_ranges = [(1,2), (3,4), (5,6), (7,8), (9,10), (11,12)]
 for video_file in video_transcription_map:
-    print(f"\nHow many clips do you want for '{video_file}'?")
-    for i, (low, high) in enumerate(clip_ranges, 1):
-        print(f"  {i}) {low}-{high}")
-    try:
-        user_choice = int(input("Your choice: ").strip().replace('\n', ''))
-        if not (1 <= user_choice <= len(clip_ranges)):
-            raise ValueError
-    except Exception:
-        print("Invalid input. Defaulting to 2 clips.")
-        user_choice = 1
-    max_clips = clip_ranges[user_choice-1][1]
+    if MAX_CLIPS_OVERRIDE > 0:
+        max_clips = MAX_CLIPS_OVERRIDE
+        print(f"\nUsing MAX_CLIPS_OVERRIDE={max_clips} for '{video_file}'.")
+    else:
+        print(f"\nHow many clips do you want for '{video_file}'?")
+        for i, (low, high) in enumerate(clip_ranges, 1):
+            print(f"  {i}) {low}-{high}")
+        try:
+            user_choice = int(input("Your choice: ").strip().replace('\n', ''))
+            if not (1 <= user_choice <= len(clip_ranges)):
+                raise ValueError
+        except Exception:
+            print("Invalid input. Defaulting to 2 clips.")
+            user_choice = 1
+        max_clips = clip_ranges[user_choice-1][1]
     print(f"Will select up to {max_clips} clips (if available and engaging).\n")
     video_max_clips[video_file] = max_clips
 
 # Process each video file
+processed_videos = 0
+skipped_videos = 0
 for video_idx, (video_file, transcription_file) in enumerate(video_transcription_map.items(), 1):
     print(f"\n=== Processing Video {video_idx}/{len(video_transcription_map)}: {video_file} ===")
     input_path = os.path.abspath(os.path.join(INPUT_DIR, video_file))
@@ -474,11 +702,24 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
     transcription = load_existing_transcription(transcription_path) if transcription_file else None
     if transcription is None:
         transcription = transcribe_with_progress(input_path, transcriber)
+        if transcription is None:
+            print(f"Skipping '{video_file}' due to transcription failure or no speech.")
+            skipped_videos += 1
+            continue
         save_transcription(transcription, transcription_path)
 
     # 2. Find clips
     clipfinder = ClipFinder()
-    clips = clipfinder.find_clips(transcription=transcription)
+    try:
+        clips = run_quietly(clipfinder.find_clips, transcription=transcription)
+    except Exception as e:
+        print(f"ClipFinder failed ({e}). Using offline fallback clip selection.")
+        clips = fallback_find_clips_from_words(
+            transcription=transcription,
+            min_duration=MIN_CLIP_DURATION,
+            max_duration=MAX_CLIP_DURATION,
+            max_candidates=max(12, max_clips * 3),
+        )
     if not clips:
         print('No clips found in the video.')
         continue
@@ -546,39 +787,30 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
     for clip_index, clip in enumerate(selected_clips):
         print(f'\n--- Processing Clip {clip_index + 1}/{len(selected_clips)} ---')
         # 4. Trim the video to the selected clip
-        media_editor = MediaEditor()
-        media_file = AudioVideoFile(input_path)
         trimmed_path = os.path.join(OUTPUT_DIR, f'trimmed_clip_{clip_index + 1}.mp4')
         print('Trimming video to selected clip...')
-        trimmed_media_file = media_editor.trim(
-            media_file=media_file,
+        if not trim_video_ffmpeg(
+            input_path=input_path,
+            output_path=trimmed_path,
             start_time=clip.start_time,
             end_time=clip.end_time,
-            trimmed_media_file_path=trimmed_path
+        ):
+            print("Failed to trim clip with ffmpeg. Skipping this clip.")
+            continue
+        # 5. Resize to 9:16 with strategy chain
+        print(f"Resizing video to 9:16 (mode={RESIZE_MODE})...")
+        resize_result = resize_with_strategy(
+            mode=RESIZE_MODE,
+            input_path=trimmed_path,
+            output_dir=OUTPUT_DIR,
+            clip_index=clip_index + 1,
+            ai_resize_allowed=AI_RESIZE_ALLOWED,
+            huggingface_token=HUGGINGFACE_TOKEN,
+            aspect_ratio=(ASPECT_RATIO_WIDTH, ASPECT_RATIO_HEIGHT),
         )
-        # 5. Try to resize to 9:16 aspect ratio
-        output_path = os.path.join(OUTPUT_DIR, f'yt_short_{clip_index + 1}.mp4')
-        try:
-            print('Resizing video to 9:16 aspect ratio...')
-            aspect_ratio_width = int(os.getenv('ASPECT_RATIO_WIDTH', '9'))
-            aspect_ratio_height = int(os.getenv('ASPECT_RATIO_HEIGHT', '16'))
-            crops = resize(
-                video_file_path=trimmed_path,
-                pyannote_auth_token=HUGGINGFACE_TOKEN,
-                aspect_ratio=(aspect_ratio_width, aspect_ratio_height)
-            )
-            resized_video_file = media_editor.resize_video(
-                original_video_file=AudioVideoFile(trimmed_path),
-                resized_video_file_path=output_path,
-                width=crops.crop_width,
-                height=crops.crop_height,
-                segments=crops.to_dict()["segments"],
-            )
-            print(f'YouTube Short (9:16) saved to {output_path}')
-        except Exception as e:
-            print(f'Resizing failed: {e}')
-            print('Saving trimmed clip without resizing...')
-            output_path = trimmed_path
+        AI_RESIZE_ALLOWED = resize_result.ai_resize_allowed
+        output_path = resize_result.output_path
+        print(f"Resize strategy used: {resize_result.strategy_used} ({resize_result.details})")
         # 6. Add styled subtitles
         final_output = create_animated_subtitles(output_path, transcription, clip, output_path)
         # 7. Generate viral title using Groq API
@@ -592,5 +824,6 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
         viral_path = os.path.join(OUTPUT_DIR, viral_filename)
         shutil.copy(final_output, viral_path)
         print(f"Final video saved as: {viral_path}\n")
+    processed_videos += 1
 
-print(f"\nSuccessfully created YouTube Shorts for {len(video_transcription_map)} video(s)!")
+print(f"\nProcessing complete. Success: {processed_videos}, Skipped: {skipped_videos}, Total: {len(video_transcription_map)}")
