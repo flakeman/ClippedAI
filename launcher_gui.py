@@ -91,6 +91,7 @@ class App(tk.Tk):
 
         bottom = ttk.Frame(self)
         bottom.pack(fill="x", padx=10, pady=8)
+        ttk.Button(bottom, text="Check env", command=self._check_environment).pack(side="left", padx=4)
         ttk.Button(bottom, text="Select all", command=self._select_all).pack(side="left", padx=4)
         ttk.Button(bottom, text="Clear", command=self._clear_all).pack(side="left", padx=4)
         ttk.Button(bottom, text="Copy log", command=self._copy_log).pack(side="left", padx=4)
@@ -216,6 +217,64 @@ class App(tk.Tk):
             )
         return True, f"ffmpeg={ffmpeg}; ffprobe={ffprobe}"
 
+    def _validate_runtime_environment(self):
+        checks = []
+        ok = True
+
+        env_file = PROJECT_DIR / ".env"
+        checks.append((env_file.exists(), f".env present: {env_file}"))
+        if not env_file.exists():
+            ok = False
+
+        ff_ok, ff_msg = self._validate_ffmpeg_tools()
+        checks.append((ff_ok, f"ffmpeg tools: {ff_msg}"))
+        if not ff_ok:
+            ok = False
+
+        input_path = Path(self.input_dir.get())
+        input_ok = input_path.exists() and input_path.is_dir()
+        checks.append((input_ok, f"input dir: {input_path}"))
+        if not input_ok:
+            ok = False
+
+        output_path = Path(self.output_dir.get())
+        output_ok = True
+        try:
+            output_path.mkdir(parents=True, exist_ok=True)
+            probe_file = output_path / "write_probe.txt"
+            probe_file.write_text("ok", encoding="utf-8")
+            probe_file.unlink(missing_ok=True)
+        except Exception as e:
+            output_ok = False
+            checks.append((False, f"output dir write failed: {output_path} ({e})"))
+            ok = False
+        if output_ok:
+            checks.append((True, f"output dir writable: {output_path}"))
+
+        hf_token = os.getenv("HUGGINGFACE_TOKEN", "").strip() or self._read_dotenv_value("HUGGINGFACE_TOKEN")
+        groq_token = os.getenv("GROQ_API_KEY", "").strip() or self._read_dotenv_value("GROQ_API_KEY")
+        hf_ok = bool(hf_token and hf_token != "your_huggingface_token_here")
+        groq_ok = bool(groq_token and groq_token != "your_groq_api_key_here")
+        checks.append((hf_ok, "HUGGINGFACE_TOKEN configured"))
+        checks.append((groq_ok, "GROQ_API_KEY configured"))
+        if not hf_ok:
+            ok = False
+
+        return ok, checks
+
+    def _check_environment(self):
+        ok, checks = self._validate_runtime_environment()
+        lines = []
+        for item_ok, msg in checks:
+            prefix = "OK" if item_ok else "FAIL"
+            lines.append(f"[{prefix}] {msg}")
+            self._log(f"Env check {prefix}: {msg}")
+        text = "\n".join(lines)
+        if ok:
+            messagebox.showinfo("Environment check", text)
+        else:
+            messagebox.showwarning("Environment check", text)
+
     def _log(self, message: str):
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}] {message}"
@@ -234,6 +293,11 @@ class App(tk.Tk):
         if not selected_keys:
             messagebox.showwarning("No videos", "Select at least one video.")
             self._log("Start rejected: no videos selected.")
+            return
+        env_ok, env_checks = self._validate_runtime_environment()
+        if not env_ok:
+            self._log("Start rejected: environment checks failed. Use 'Check env' for details.")
+            messagebox.showerror("Environment not ready", "Environment checks failed. Click 'Check env' to view details.")
             return
         tools_ok, tools_msg = self._validate_ffmpeg_tools()
         if not tools_ok:
