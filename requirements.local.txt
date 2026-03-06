@@ -6,3 +6,4 @@ python-dotenv
 customtkinter
 torch==2.5.1
 faster-whisper
+yt-dlp

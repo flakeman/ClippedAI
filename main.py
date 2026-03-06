@@ -208,16 +208,16 @@ SUBTITLE_STYLE_PRESETS = {
     "minimal": {
         "font": "Trebuchet MS Bold",
         "highlight_font": "Trebuchet MS Bold",
-        "font_size": 68,
+        "font_size": 74,
         "primary": "&H00FFFFFF",
         "highlight": "&H00C8FFB4",
         "outline": "&H30000000",
         "back": "&HFF000000",
-        "outline_size": 10,
+        "outline_size": 12,
         "shadow": 0,
         "spacing": 0,
-        "alignment": 2,
-        "margin_v": 90,
+        "alignment": 8,
+        "margin_v": 125,
     },
     "newsflash": {
         "font": "Arial Rounded MT Bold",
@@ -770,8 +770,11 @@ def create_animated_subtitles(video_path, transcription, clip, output_path, groq
 
     if ENABLE_TEXT_POSTPROCESS:
         for cue in cues:
+            original_text = cue["text"]
             cue["text"] = normalize_transcript_text(cue["text"])
             cue["text"] = maybe_correct_text_with_llm(cue["text"], groq_api_key)
+            if not cue["text"].strip():
+                cue["text"] = original_text
 
     clip_text_for_style = " ".join(cue["text"] for cue in cues[:8])
     clip_word_count = sum(len(cue["text"].split()) for cue in cues)

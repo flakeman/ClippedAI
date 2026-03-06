@@ -11,6 +11,8 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
+from source_fetcher import download_video, search_youtube
+
 
 PROJECT_DIR = Path(__file__).resolve().parent
 PYTHON_EXE = PROJECT_DIR / "env311" / "Scripts" / "python.exe"
@@ -44,6 +46,9 @@ class App(tk.Tk):
         self.llm_correction = tk.BooleanVar(value=False)
         self.subtitle_style_mode = tk.StringVar(value="auto")
         self.subtitle_style_preset = tk.StringVar(value="bold_clean")
+        self.source_query = tk.StringVar(value="")
+        self.auto_process_download = tk.BooleanVar(value=True)
+        self.search_results = []
 
         self.video_vars = {}
         self.video_paths = {}
@@ -69,6 +74,17 @@ class App(tk.Tk):
         ttk.Label(top, text="Output folder").grid(row=1, column=0, sticky="w")
         ttk.Entry(top, textvariable=self.output_dir, width=80).grid(row=1, column=1, padx=6, sticky="ew")
         ttk.Button(top, text="Browse", command=self._pick_output).grid(row=1, column=2)
+
+        source = ttk.LabelFrame(self, text="Source")
+        source.pack(fill="x", padx=10, pady=6)
+        ttk.Label(source, text="URL or search").grid(row=0, column=0, sticky="w")
+        self.source_entry = ttk.Entry(source, textvariable=self.source_query, width=90)
+        self.source_entry.grid(row=0, column=1, padx=6, sticky="ew")
+        self.source_entry.bind("<Button-3>", self._show_source_context_menu)
+        ttk.Button(source, text="Search", command=self._search_source).grid(row=0, column=2, padx=4)
+        ttk.Button(source, text="Download", command=self._download_source).grid(row=0, column=3, padx=4)
+        ttk.Button(source, text="Paste", command=self._paste_source).grid(row=0, column=4, padx=4)
+        ttk.Checkbutton(source, text="Auto process after download", variable=self.auto_process_download).grid(row=0, column=5, padx=8, sticky="w")
 
         opts = ttk.Frame(self)
         opts.pack(fill="x", padx=10, pady=8)
@@ -140,6 +156,112 @@ class App(tk.Tk):
         p = filedialog.askdirectory(initialdir=self.output_dir.get())
         if p:
             self.output_dir.set(p)
+
+    def _paste_source(self):
+        try:
+            text = self.clipboard_get()
+        except Exception:
+            text = ""
+        if text:
+            self.source_query.set(text.strip())
+            self._log("Pasted source query from clipboard.")
+            self.source_entry.focus_set()
+
+    def _show_source_context_menu(self, event):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Paste", command=self._paste_source)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _search_source(self):
+        query = self.source_query.get().strip()
+        if not query:
+            messagebox.showwarning("No query", "Enter a YouTube URL or search query.")
+            return
+        self._log(f"Searching source: {query}")
+
+        def worker():
+            try:
+                self.queue.put(("log", "Search: started"))
+                results = search_youtube(
+                    query,
+                    limit=5,
+                    logger=lambda message: self.queue.put(("log", f"Search: {message}")),
+                )
+                self.queue.put(("log", f"Search: finished with {len(results)} result(s)"))
+                self.queue.put(("search_results", results))
+            except Exception as e:
+                self.queue.put(("log", f"Search failed: {e}"))
+                self.queue.put(("search_error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_search_results_dialog(self):
+        if not self.search_results:
+            messagebox.showinfo("Search", "No search results.")
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Search Results")
+        dialog.geometry("920x320")
+        dialog.transient(self)
+
+        tree = ttk.Treeview(dialog, columns=("title", "uploader", "year", "views", "duration"), show="headings", height=10)
+        tree.heading("title", text="Title")
+        tree.heading("uploader", text="Uploader")
+        tree.heading("year", text="Year")
+        tree.heading("views", text="Views")
+        tree.heading("duration", text="Duration")
+        tree.column("title", width=500, anchor="w")
+        tree.column("uploader", width=170, anchor="w")
+        tree.column("year", width=60, anchor="center")
+        tree.column("views", width=90, anchor="e")
+        tree.column("duration", width=80, anchor="center")
+        tree.pack(fill="both", expand=True, padx=8, pady=8)
+
+        for idx, item in enumerate(self.search_results):
+            duration = item.get("duration") or "-"
+            year = item.get("year") or "-"
+            views = item.get("view_count") or 0
+            tree.insert("", "end", iid=str(idx), values=(item["title"], item.get("uploader", ""), year, views, duration))
+
+        def use_selected():
+            selected = tree.selection()
+            if not selected:
+                return
+            item = self.search_results[int(selected[0])]
+            url = item.get("webpage_url") or item.get("url") or ""
+            self.source_query.set(url)
+            self._log(f"Selected search result: {item['title']}")
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(buttons, text="Use selected", command=use_selected).pack(side="right")
+        ttk.Button(buttons, text="Close", command=dialog.destroy).pack(side="right", padx=6)
+
+    def _download_source(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Busy", "Processing is already running.")
+            return
+        source = self.source_query.get().strip()
+        if not source:
+            messagebox.showwarning("No source", "Enter a YouTube URL or search query.")
+            return
+        self._log(f"Downloading source: {source}")
+
+        def worker():
+            try:
+                self.queue.put(("log", "Download: started"))
+                downloaded = download_video(
+                    source,
+                    self.input_dir.get(),
+                    logger=lambda message: self.queue.put(("log", f"Download: {message}")),
+                )
+                self.queue.put(("download_done", str(downloaded)))
+            except Exception as e:
+                self.queue.put(("log", f"Download failed: {e}"))
+                self.queue.put(("download_error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _refresh_videos(self):
         self._log(f"Scanning input folder: {self.input_dir.get()}")
@@ -280,6 +402,13 @@ class App(tk.Tk):
         checks.append((groq_ok, "GROQ_API_KEY configured"))
         if not hf_ok:
             ok = False
+        ytdlp_ok = shutil.which("yt-dlp") is not None
+        try:
+            import yt_dlp  # noqa: F401
+            ytdlp_ok = True
+        except Exception:
+            pass
+        checks.append((ytdlp_ok, "yt-dlp available for source search/download"))
         if self.llm_correction.get() and not groq_ok:
             checks.append((False, "LLM text correction requires GROQ_API_KEY"))
             ok = False
@@ -561,6 +690,21 @@ class App(tk.Tk):
                     self.overall_label.config(text=f"Overall: {overall}%")
                 elif kind == "log":
                     self._log(msg[1])
+                elif kind == "search_results":
+                    self.search_results = msg[1]
+                    self._log(f"Search returned {len(self.search_results)} result(s).")
+                    self._show_search_results_dialog()
+                elif kind == "search_error":
+                    messagebox.showerror("Search failed", msg[1])
+                elif kind == "download_done":
+                    downloaded_path = msg[1]
+                    self._log(f"Download completed: {downloaded_path}")
+                    self._refresh_videos()
+                    if self.auto_process_download.get():
+                        self._log("Auto process after download is enabled. Starting pipeline.")
+                        self._start()
+                elif kind == "download_error":
+                    messagebox.showerror("Download failed", msg[1])
                 elif kind == "done":
                     # Save full session log for easy sharing.
                     try:
