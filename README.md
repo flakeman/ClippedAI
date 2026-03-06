@@ -220,7 +220,7 @@ python launcher_gui.py
 ```
 
 The launcher allows batch selection, resize mode/profile selection, and saves a session log in `output/`.
-It also supports transcription language mode and optional Groq-based transcript cleanup.
+It also supports transcription language mode, optional Groq-based transcript cleanup, and AI-selected subtitle style presets.
 
 ## Customization
 
@@ -260,6 +260,8 @@ All key settings can now be configured through the `.env` file:
 | `NORMALIZE_PUNCTUATION` | true | Normalize spacing and punctuation in transcript text |
 | `CLEAN_REPEATS` | true | Remove obvious repeated words/phrases from transcript text |
 | `LLM_TEXT_CORRECTION` | false | Run an optional Groq correction pass on subtitle/title text |
+| `SUBTITLE_STYLE_MODE` | auto | `auto` lets AI/heuristics choose a preset, `manual` forces one |
+| `SUBTITLE_STYLE_PRESET` | bold_clean | Preset: `bold_clean`, `dramatic`, `minimal`, `newsflash` |
 | `FFMPEG_EXE` | (empty) | Absolute path to ffmpeg executable (optional override) |
 | `FFPROBE_EXE` | (empty) | Absolute path to ffprobe executable (optional override) |
 

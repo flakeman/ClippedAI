@@ -146,6 +146,8 @@ ENABLE_TEXT_POSTPROCESS = os.getenv("ENABLE_TEXT_POSTPROCESS", "true").lower() =
 NORMALIZE_PUNCTUATION = os.getenv("NORMALIZE_PUNCTUATION", "true").lower() == "true"
 CLEAN_REPEATS = os.getenv("CLEAN_REPEATS", "true").lower() == "true"
 LLM_TEXT_CORRECTION = os.getenv("LLM_TEXT_CORRECTION", "false").lower() == "true"
+SUBTITLE_STYLE_MODE = os.getenv("SUBTITLE_STYLE_MODE", "auto").lower()
+SUBTITLE_STYLE_PRESET = os.getenv("SUBTITLE_STYLE_PRESET", "bold_clean").lower()
 TITLE_PROMPT_TEMPLATE = os.getenv(
     "TITLE_PROMPT_TEMPLATE",
     "Given the following transcript, generate a catchy, viral YouTube Shorts title (max 7 words). "
@@ -159,60 +161,77 @@ TEXT_CORRECTION_PROMPT_TEMPLATE = os.getenv(
     "Remove accidental repeated words/phrases. Preserve the original meaning and language. "
     "Return only the corrected text.\n\nLanguage: {language}\n\nTranscript:\n{transcript}"
 )
+SUBTITLE_STYLE_PROMPT_TEMPLATE = os.getenv(
+    "SUBTITLE_STYLE_PROMPT_TEMPLATE",
+    "Choose the best subtitle style preset for this clip. "
+    "Return only one preset id from this list: bold_clean, dramatic, minimal, newsflash. "
+    "Pick dramatic for emotionally intense or shocking content. "
+    "Pick newsflash for factual, commentary, interview, explainer, or documentary content. "
+    "Pick minimal for calm, reflective, aesthetic, or slow-paced content. "
+    "Pick bold_clean for general short-form content.\n\nTranscript:\n{transcript}"
+)
 
 # --- Subtitles ---
 SUBTITLE_FONT = "Montserrat Extra Bold"
 SUBTITLE_FONT_SIZE = 80
 SUBTITLE_ALIGNMENT = 8  # Top center
 SUBTITLE_MARGIN_V = 120
-SUBTITLE_STYLES = {
-    "Default": {
-        "Fontname": SUBTITLE_FONT,
-        "Fontsize": SUBTITLE_FONT_SIZE,
-        "PrimaryColour": "&H00FFFFFF",  # White
-        "SecondaryColour": "&H000000FF",
-        "OutlineColour": "&H40000000",
-        "BackColour": "&HFF000000",
-        "Bold": -1,
-        "Italic": 0,
-        "Underline": 0,
-        "StrikeOut": 0,
-        "ScaleX": 100,
-        "ScaleY": 100,
-        "Spacing": 2,
-        "Angle": 0,
-        "BorderStyle": 1,
-        "Outline": 15,
-        "Shadow": 0,
-        "Alignment": SUBTITLE_ALIGNMENT,
-        "MarginL": 30,
-        "MarginR": 30,
-        "MarginV": SUBTITLE_MARGIN_V,
-        "Encoding": 1,
+SUBTITLE_STYLE_PRESETS = {
+    "bold_clean": {
+        "font": "Montserrat Extra Bold",
+        "highlight_font": "Montserrat Extra Bold",
+        "font_size": 80,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H0000FFFF",
+        "outline": "&H40000000",
+        "back": "&HFF000000",
+        "outline_size": 15,
+        "shadow": 0,
+        "spacing": 2,
+        "alignment": 8,
+        "margin_v": 120,
     },
-    "Yellow": {
-        "Fontname": SUBTITLE_FONT,
-        "Fontsize": SUBTITLE_FONT_SIZE,
-        "PrimaryColour": "&H0000FFFF",  # Yellow
-        "SecondaryColour": "&H000000FF",
-        "OutlineColour": "&H40000000",
-        "BackColour": "&HFF000000",
-        "Bold": -1,
-        "Italic": 0,
-        "Underline": 0,
-        "StrikeOut": 0,
-        "ScaleX": 100,
-        "ScaleY": 100,
-        "Spacing": 2,
-        "Angle": 0,
-        "BorderStyle": 1,
-        "Outline": 15,
-        "Shadow": 0,
-        "Alignment": SUBTITLE_ALIGNMENT,
-        "MarginL": 30,
-        "MarginR": 30,
-        "MarginV": SUBTITLE_MARGIN_V,
-        "Encoding": 1,
+    "dramatic": {
+        "font": "Arial Black",
+        "highlight_font": "Arial Black",
+        "font_size": 86,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H0000A5FF",
+        "outline": "&H60000000",
+        "back": "&HFF000000",
+        "outline_size": 18,
+        "shadow": 1,
+        "spacing": 1,
+        "alignment": 8,
+        "margin_v": 140,
+    },
+    "minimal": {
+        "font": "Trebuchet MS Bold",
+        "highlight_font": "Trebuchet MS Bold",
+        "font_size": 68,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H00C8FFB4",
+        "outline": "&H30000000",
+        "back": "&HFF000000",
+        "outline_size": 10,
+        "shadow": 0,
+        "spacing": 0,
+        "alignment": 2,
+        "margin_v": 90,
+    },
+    "newsflash": {
+        "font": "Arial Rounded MT Bold",
+        "highlight_font": "Arial Rounded MT Bold",
+        "font_size": 74,
+        "primary": "&H00FFFFFF",
+        "highlight": "&H0000CCFF",
+        "outline": "&H50000000",
+        "back": "&HFF000000",
+        "outline_size": 14,
+        "shadow": 0,
+        "spacing": 1,
+        "alignment": 8,
+        "margin_v": 110,
     },
 }
 
@@ -367,6 +386,126 @@ def maybe_correct_text_with_llm(text: str, groq_api_key: str) -> str:
     except Exception as e:
         print(f"Text correction skipped: {e}")
         return text
+
+
+def estimate_visual_style_signal(video_path: str) -> dict:
+    """Estimate simple visual signals from a few frames for subtitle style choice."""
+    try:
+        import cv2
+    except Exception:
+        return {"brightness": 128.0, "contrast": 32.0}
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return {"brightness": 128.0, "contrast": 32.0}
+
+    brightness_values = []
+    contrast_values = []
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    sample_points = [0.15, 0.4, 0.65, 0.85]
+    try:
+        for point in sample_points:
+            if total_frames > 0:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(total_frames * point))
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            brightness_values.append(float(gray.mean()))
+            contrast_values.append(float(gray.std()))
+    finally:
+        cap.release()
+
+    if not brightness_values:
+        return {"brightness": 128.0, "contrast": 32.0}
+    return {
+        "brightness": sum(brightness_values) / len(brightness_values),
+        "contrast": sum(contrast_values) / len(contrast_values),
+    }
+
+
+def choose_subtitle_style_preset(
+    transcript_text: str,
+    groq_api_key: str,
+    engagement_score: float = 0.0,
+    clip_duration: float = 0.0,
+    word_count: int = 0,
+    video_path: str = "",
+) -> str:
+    """Choose subtitle style preset using manual mode, AI, or local heuristic fallback."""
+    if SUBTITLE_STYLE_MODE == "manual" and SUBTITLE_STYLE_PRESET in SUBTITLE_STYLE_PRESETS:
+        return SUBTITLE_STYLE_PRESET
+
+    def heuristic() -> str:
+        lower = (transcript_text or "").lower()
+        visual = estimate_visual_style_signal(video_path) if video_path else {"brightness": 128.0, "contrast": 32.0}
+        scores = {"bold_clean": 0.0, "dramatic": 0.0, "minimal": 0.0, "newsflash": 0.0}
+
+        if any(token in lower for token in ["breaking", "explains", "interview", "report", "today", "why", "how", "fact", "story"]):
+            scores["newsflash"] += 2.0
+        if any(token in lower for token in ["insane", "crazy", "shocking", "unbelievable", "danger", "almost", "risk", "dead", "fight"]):
+            scores["dramatic"] += 2.0
+        if any(token in lower for token in ["calm", "quiet", "slow", "peace", "aesthetic", "beautiful", "morning", "cozy", "soft"]):
+            scores["minimal"] += 2.0
+
+        word_density = word_count / clip_duration if clip_duration > 0 else 0.0
+        if engagement_score >= 0.6:
+            scores["dramatic"] += 1.5
+            scores["bold_clean"] += 0.8
+        elif engagement_score >= 0.4:
+            scores["bold_clean"] += 1.2
+            scores["newsflash"] += 0.8
+        else:
+            scores["minimal"] += 0.6
+
+        if word_density >= 2.4:
+            scores["newsflash"] += 1.5
+            scores["minimal"] -= 0.5
+        elif word_density <= 1.3:
+            scores["minimal"] += 1.2
+
+        if clip_duration >= 75:
+            scores["newsflash"] += 0.8
+            scores["minimal"] += 0.4
+        else:
+            scores["dramatic"] += 0.5
+            scores["bold_clean"] += 0.5
+
+        if visual["brightness"] < 85 or visual["contrast"] > 60:
+            scores["dramatic"] += 1.0
+        if visual["brightness"] > 155 and visual["contrast"] < 45:
+            scores["minimal"] += 1.0
+        if 90 <= visual["brightness"] <= 155:
+            scores["bold_clean"] += 0.7
+
+        return max(scores.items(), key=lambda item: item[1])[0]
+
+    if SUBTITLE_STYLE_MODE != "auto":
+        return heuristic()
+
+    try:
+        content = call_groq_text_api(
+            SUBTITLE_STYLE_PROMPT_TEMPLATE.format(transcript=transcript_text[:1800]),
+            groq_api_key,
+            max_tokens=16,
+            temperature=0.1,
+        )
+        if content:
+            preset = content.strip().splitlines()[0].strip().lower()
+            preset = preset.replace("-", "_").replace(" ", "_")
+            if preset in SUBTITLE_STYLE_PRESETS:
+                return preset
+    except Exception as e:
+        print(f"Subtitle style auto-selection fallback: {e}")
+    return heuristic()
+
+
+def build_ass_style_line(name: str, font_name: str, font_size: int, primary: str, outline: str, back: str, outline_size: int, shadow: int, spacing: int, alignment: int, margin_v: int) -> str:
+    """Build one ASS style line."""
+    return (
+        f"Style: {name},{font_name},{font_size},{primary},&H000000FF,{outline},{back},"
+        f"-1,0,0,0,100,100,{spacing},0,1,{outline_size},{shadow},{alignment},30,30,{margin_v},1"
+    )
 
 
 def build_clip_text(word_info: List[dict], clip: Clip, groq_api_key: str = "") -> str:
@@ -633,11 +772,23 @@ def create_animated_subtitles(video_path, transcription, clip, output_path, groq
         for cue in cues:
             cue["text"] = normalize_transcript_text(cue["text"])
             cue["text"] = maybe_correct_text_with_llm(cue["text"], groq_api_key)
-    
-    # Determine font used and print to console
-    font_used = "Montserrat Extra Bold"
-    print(f"Subtitles will use font: {font_used}")
-    print("NOTE: Ensure 'Montserrat Extra Bold' font is installed or is available in the fonts directory.")
+
+    clip_text_for_style = " ".join(cue["text"] for cue in cues[:8])
+    clip_word_count = sum(len(cue["text"].split()) for cue in cues)
+    clip_duration = max(0.0, clip.end_time - clip.start_time)
+    clip_engagement = calculate_engagement_score(clip, transcription)
+    style_preset = choose_subtitle_style_preset(
+        clip_text_for_style,
+        groq_api_key,
+        engagement_score=clip_engagement,
+        clip_duration=clip_duration,
+        word_count=clip_word_count,
+        video_path=video_path,
+    )
+    style = SUBTITLE_STYLE_PRESETS.get(style_preset, SUBTITLE_STYLE_PRESETS["bold_clean"])
+    print(f"Subtitle style preset: {style_preset}")
+    print(f"Subtitles will use font: {style['font']}")
+    print(f"NOTE: Ensure '{style['font']}' font is installed or is available in the fonts directory.")
 
     # Write ASS subtitle file with clean, bold styling at the TOP CENTER
     ass_file = os.path.join(OUTPUT_DIR, 'temp_subtitles.ass')
@@ -651,16 +802,36 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Montserrat Extra Bold,80,&H00FFFFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: Yellow,Montserrat Extra Bold,80,&H0000FFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: Fallback,Arial Rounded MT Bold,80,&H00FFFFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: FallbackYellow,Arial Rounded MT Bold,80,&H0000FFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: Fallback2,Arial Black,80,&H00FFFFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
-Style: Fallback2Yellow,Arial Black,80,&H0000FFFF,&H000000FF,&H40000000,&HFF000000,-1,0,0,0,100,100,2,0,1,15,0,8,30,30,120,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """)
+        f.write(build_ass_style_line(
+            "Default",
+            style["font"],
+            style["font_size"],
+            style["primary"],
+            style["outline"],
+            style["back"],
+            style["outline_size"],
+            style["shadow"],
+            style["spacing"],
+            style["alignment"],
+            style["margin_v"],
+        ) + "\n")
+        f.write(build_ass_style_line(
+            "Yellow",
+            style["highlight_font"],
+            style["font_size"],
+            style["highlight"],
+            style["outline"],
+            style["back"],
+            style["outline_size"],
+            style["shadow"],
+            style["spacing"],
+            style["alignment"],
+            style["margin_v"],
+        ) + "\n\n")
         for cue in cues:
             start = ass_time(cue['start'])
             end = ass_time(cue['end'])

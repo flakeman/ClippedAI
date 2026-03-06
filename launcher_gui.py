@@ -21,6 +21,8 @@ NO_OUTPUT_TIMEOUT_SEC = int(os.getenv("NO_OUTPUT_TIMEOUT_SEC", "0"))
 SUPPORTED_TRANSCRIPTION_MODELS = ["medium", "large-v1", "large-v2"]
 SUPPORTED_FORCED_LANGUAGES = ["en", "fr", "de", "es", "it", "ja", "zh", "nl", "uk", "pt"]
 SUPPORTED_TRANSCRIPTION_BACKENDS = ["clipsai", "faster_whisper"]
+SUPPORTED_SUBTITLE_STYLE_MODES = ["auto", "manual"]
+SUPPORTED_SUBTITLE_STYLE_PRESETS = ["bold_clean", "dramatic", "minimal", "newsflash"]
 
 
 class App(tk.Tk):
@@ -32,14 +34,16 @@ class App(tk.Tk):
 
         self.input_dir = tk.StringVar(value=str(PROJECT_DIR / "input"))
         self.output_dir = tk.StringVar(value=str(PROJECT_DIR / "output"))
-        self.resize_mode = tk.StringVar(value="auto")
-        self.max_clips = tk.IntVar(value=2)
-        self.model_name = tk.StringVar(value="large-v2")
-        self.transcription_backend = tk.StringVar(value="clipsai")
+        self.resize_mode = tk.StringVar(value="local_ai")
+        self.max_clips = tk.IntVar(value=1)
+        self.model_name = tk.StringVar(value="medium")
+        self.transcription_backend = tk.StringVar(value="faster_whisper")
         self.profile_name = tk.StringVar(value="Balanced")
         self.language_mode = tk.StringVar(value="auto")
-        self.forced_language = tk.StringVar(value="en")
+        self.forced_language = tk.StringVar(value="")
         self.llm_correction = tk.BooleanVar(value=False)
+        self.subtitle_style_mode = tk.StringVar(value="auto")
+        self.subtitle_style_preset = tk.StringVar(value="bold_clean")
 
         self.video_vars = {}
         self.video_paths = {}
@@ -80,6 +84,9 @@ class App(tk.Tk):
         ttk.Label(opts, text="Language").grid(row=1, column=3, sticky="w", pady=(8, 0))
         ttk.Combobox(opts, textvariable=self.language_mode, values=["auto", "forced"], width=10, state="readonly").grid(row=1, column=4, padx=6, pady=(8, 0), sticky="w")
         ttk.Entry(opts, textvariable=self.forced_language, width=8).grid(row=1, column=5, padx=6, pady=(8, 0), sticky="w")
+        ttk.Label(opts, text="Subtitle style").grid(row=2, column=0, sticky="w", pady=(8, 0))
+        ttk.Combobox(opts, textvariable=self.subtitle_style_mode, values=SUPPORTED_SUBTITLE_STYLE_MODES, width=10, state="readonly").grid(row=2, column=1, padx=6, pady=(8, 0), sticky="w")
+        ttk.Combobox(opts, textvariable=self.subtitle_style_preset, values=SUPPORTED_SUBTITLE_STYLE_PRESETS, width=14, state="readonly").grid(row=2, column=2, padx=6, pady=(8, 0), sticky="w")
         ttk.Label(opts, text="Profile").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Combobox(
             opts,
@@ -296,6 +303,13 @@ class App(tk.Tk):
         if not backend_ok:
             ok = False
 
+        style_mode_ok = self.subtitle_style_mode.get() in SUPPORTED_SUBTITLE_STYLE_MODES
+        style_preset_ok = self.subtitle_style_preset.get() in SUPPORTED_SUBTITLE_STYLE_PRESETS
+        checks.append((style_mode_ok, f"subtitle style mode: {self.subtitle_style_mode.get()}"))
+        checks.append((style_preset_ok, f"subtitle style preset: {self.subtitle_style_preset.get()}"))
+        if not style_mode_ok or not style_preset_ok:
+            ok = False
+
         return ok, checks
 
     def _check_environment(self):
@@ -344,6 +358,7 @@ class App(tk.Tk):
             f"Start processing: {len(selected_keys)} video(s), mode={self.resize_mode.get()}, "
             f"backend={self.transcription_backend.get()}, max_clips={int(self.max_clips.get())}, model={self.model_name.get()}, "
             f"language_mode={self.language_mode.get()}, forced_language={self.forced_language.get().strip().lower() or '-'}, "
+            f"subtitle_style={self.subtitle_style_mode.get()}/{self.subtitle_style_preset.get()}, "
             f"llm_correction={self.llm_correction.get()}, "
             f"timeout={'disabled' if NO_OUTPUT_TIMEOUT_SEC <= 0 else str(NO_OUTPUT_TIMEOUT_SEC)+'s'}."
         )
@@ -363,16 +378,34 @@ class App(tk.Tk):
             self.model_name.set("medium")
             self.resize_mode.set("ffmpeg")
             self.max_clips.set(1)
+            self.transcription_backend.set("faster_whisper")
+            self.language_mode.set("auto")
+            self.llm_correction.set(False)
+            self.subtitle_style_mode.set("manual")
+            self.subtitle_style_preset.set("bold_clean")
         elif p == "Quality CPU":
             self.model_name.set("large-v2")
             self.resize_mode.set("local_ai")
             self.max_clips.set(2)
+            self.transcription_backend.set("faster_whisper")
+            self.language_mode.set("auto")
+            self.llm_correction.set(False)
+            self.subtitle_style_mode.set("auto")
+            self.subtitle_style_preset.set("bold_clean")
         else:
-            self.model_name.set("large-v2")
-            self.resize_mode.set("auto")
-            self.max_clips.set(2)
+            self.model_name.set("medium")
+            self.resize_mode.set("local_ai")
+            self.max_clips.set(1)
+            self.transcription_backend.set("faster_whisper")
+            self.language_mode.set("auto")
+            self.llm_correction.set(False)
+            self.subtitle_style_mode.set("auto")
+            self.subtitle_style_preset.set("bold_clean")
         self._log(
-            f"Profile applied: {p} (model={self.model_name.get()}, resize={self.resize_mode.get()}, max_clips={int(self.max_clips.get())})"
+            f"Profile applied: {p} (backend={self.transcription_backend.get()}, model={self.model_name.get()}, "
+            f"resize={self.resize_mode.get()}, max_clips={int(self.max_clips.get())}, "
+            f"language_mode={self.language_mode.get()}, subtitle_style={self.subtitle_style_mode.get()}/{self.subtitle_style_preset.get()}, "
+            f"llm_correction={self.llm_correction.get()})"
         )
 
     def _run_jobs(self, video_keys):
@@ -405,6 +438,8 @@ class App(tk.Tk):
                 env["TRANSCRIPTION_LANGUAGE_MODE"] = self.language_mode.get().strip().lower()
                 env["FORCED_LANGUAGE"] = self.forced_language.get().strip().lower()
                 env["LLM_TEXT_CORRECTION"] = "true" if self.llm_correction.get() else "false"
+                env["SUBTITLE_STYLE_MODE"] = self.subtitle_style_mode.get().strip().lower()
+                env["SUBTITLE_STYLE_PRESET"] = self.subtitle_style_preset.get().strip().lower()
 
                 cmd = [str(PYTHON_EXE), "-u", str(MAIN_PY)]
                 proc = subprocess.Popen(
