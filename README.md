@@ -149,10 +149,25 @@ The script uses Whisper models via `clipsai`. Choose based on your hardware:
 
 ### Changing the Model
 
-The transcription model can be configured via the `TRANSCRIPTION_MODEL` environment variable in your `.env` file:
+The transcription backend and model can be configured via `.env`:
 ```
+TRANSCRIPTION_BACKEND=clipsai  # clipsai | faster_whisper
 TRANSCRIPTION_MODEL=large-v1  # Options: tiny, base, small, medium, large-v1, large-v2
 ```
+
+`faster-whisper` is the better CPU-oriented option. `clipsai` remains useful when you want to keep the original integrated clip-finding flow.
+
+### Language Control
+
+You can let the model auto-detect language or force a specific ISO-639-1 code:
+
+```bash
+TRANSCRIPTION_LANGUAGE_MODE=auto
+FORCED_LANGUAGE=en
+```
+
+Use `forced` when a video is entirely in one language and auto-detection makes mistakes.
+Current forced-language whitelist from the underlying library: `en`, `fr`, `de`, `es`, `it`, `ja`, `zh`, `nl`, `uk`, `pt`.
 
 ## Project Structure
 
@@ -205,6 +220,7 @@ python launcher_gui.py
 ```
 
 The launcher allows batch selection, resize mode/profile selection, and saves a session log in `output/`.
+It also supports transcription language mode and optional Groq-based transcript cleanup.
 
 ## Customization
 
@@ -227,9 +243,12 @@ All key settings can now be configured through the `.env` file:
 |----------|---------|-------------|
 | `HUGGINGFACE_TOKEN` | your_huggingface_token_here | HuggingFace API token for speaker diarization |
 | `GROQ_API_KEY` | your_groq_api_key_here | Groq API key for viral title generation |
+| `TRANSCRIPTION_BACKEND` | clipsai | `clipsai` or `faster_whisper` |
 | `MIN_CLIP_DURATION` | 45 | Minimum duration in seconds for YouTube Shorts |
 | `MAX_CLIP_DURATION` | 120 | Maximum duration in seconds for YouTube Shorts |
 | `TRANSCRIPTION_MODEL` | medium | Whisper model to use (tiny, base, small, medium, large-v1, large-v2) |
+| `TRANSCRIPTION_LANGUAGE_MODE` | auto | `auto` for detection or `forced` to force a language |
+| `FORCED_LANGUAGE` | en | ISO-639-1 language code used when mode is `forced` |
 | `ASPECT_RATIO_WIDTH` | 9 | Width for aspect ratio (used with height for video resizing) |
 | `ASPECT_RATIO_HEIGHT` | 16 | Height for aspect ratio (used with width for video resizing) |
 | `RESIZE_MODE` | auto | Resize strategy: auto, ai, local_ai, ffmpeg |
@@ -237,6 +256,10 @@ All key settings can now be configured through the `.env` file:
 | `QUIET_MODE` | true | Reduce noisy third-party logs |
 | `SHOW_TITLE_PROMPT` | false | Print full Groq title prompt to console |
 | `NLTK_AUTO_DOWNLOAD` | false | Auto-download NLTK punkt resources if missing |
+| `ENABLE_TEXT_POSTPROCESS` | true | Enable transcript cleanup before titles/subtitles |
+| `NORMALIZE_PUNCTUATION` | true | Normalize spacing and punctuation in transcript text |
+| `CLEAN_REPEATS` | true | Remove obvious repeated words/phrases from transcript text |
+| `LLM_TEXT_CORRECTION` | false | Run an optional Groq correction pass on subtitle/title text |
 | `FFMPEG_EXE` | (empty) | Absolute path to ffmpeg executable (optional override) |
 | `FFPROBE_EXE` | (empty) | Absolute path to ffprobe executable (optional override) |
 
@@ -266,6 +289,14 @@ pip install clipsai
 **"ClipFinder failed ... client has been closed"**
 - Usually means model download is blocked/unavailable
 - The script now falls back to offline clip selection from transcript timing
+
+**"large-v2 is too slow on CPU"**
+- Use `TRANSCRIPTION_BACKEND=faster_whisper`
+- Or drop the model to `medium`
+
+**Metadata cleanup**
+- Final output videos are re-written with metadata stripped via `ffmpeg`
+- CapCut is not required for metadata removal in this pipeline
 
 **"CUDA out of memory"**
 - Use a smaller transcription model

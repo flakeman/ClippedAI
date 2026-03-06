@@ -2,6 +2,7 @@
 
 import os
 import pickle
+import re
 import subprocess
 import sys
 import string
@@ -72,6 +73,19 @@ nltk.download = _safe_nltk_download
 from clipsai import Transcriber, ClipFinder
 from clipsai.clip.clip import Clip
 
+SUPPORTED_TRANSCRIPTION_MODELS = ["tiny", "base", "small", "medium", "large-v1", "large-v2"]
+SUPPORTED_FORCED_LANGUAGES = ["en", "fr", "de", "es", "it", "ja", "zh", "nl", "uk", "pt"]
+
+
+class SimpleTranscription:
+    """Minimal transcription object for non-clipsai backends."""
+
+    def __init__(self, word_info: List[dict]):
+        self._word_info = word_info
+
+    def get_word_info(self):
+        return self._word_info
+
 def ensure_nltk_data(resource: str) -> None:
     """Ensure NLTK resource exists; optional quiet download if missing."""
     try:
@@ -112,8 +126,11 @@ MIN_CLIP_DURATION = int(os.getenv("MIN_CLIP_DURATION", "45"))
 MAX_CLIP_DURATION = int(os.getenv("MAX_CLIP_DURATION", "120"))
 
 # --- Transcription ---
+TRANSCRIPTION_BACKEND = os.getenv("TRANSCRIPTION_BACKEND", "clipsai").lower()
 TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "large-v1")
 MAX_CLIPS_OVERRIDE = int(os.getenv("MAX_CLIPS_OVERRIDE", "0"))
+TRANSCRIPTION_LANGUAGE_MODE = os.getenv("TRANSCRIPTION_LANGUAGE_MODE", "auto").lower()
+FORCED_LANGUAGE = os.getenv("FORCED_LANGUAGE", "en").strip().lower()
 
 # --- Resizing ---
 ASPECT_RATIO_WIDTH = int(os.getenv("ASPECT_RATIO_WIDTH", "9"))
@@ -125,12 +142,22 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "your_groq_api_key_here")
 AI_RESIZE_ALLOWED = True
 SHOW_TITLE_PROMPT = os.getenv("SHOW_TITLE_PROMPT", "true").lower() == "true"
 QUIET_MODE = os.getenv("QUIET_MODE", "true").lower() == "true"
+ENABLE_TEXT_POSTPROCESS = os.getenv("ENABLE_TEXT_POSTPROCESS", "true").lower() == "true"
+NORMALIZE_PUNCTUATION = os.getenv("NORMALIZE_PUNCTUATION", "true").lower() == "true"
+CLEAN_REPEATS = os.getenv("CLEAN_REPEATS", "true").lower() == "true"
+LLM_TEXT_CORRECTION = os.getenv("LLM_TEXT_CORRECTION", "false").lower() == "true"
 TITLE_PROMPT_TEMPLATE = os.getenv(
     "TITLE_PROMPT_TEMPLATE",
     "Given the following transcript, generate a catchy, viral YouTube Shorts title (max 7 words). "
     "ALWAYS include an emoji in the title. ONLY output the title, nothing else. Do NOT use hashtags. "
     "Do NOT explain, do NOT repeat the prompt, do NOT add quotes. The title should be in the style of these examples: "
     "{examples}.\n\nTranscript:\n{transcript}"
+)
+TEXT_CORRECTION_PROMPT_TEMPLATE = os.getenv(
+    "TEXT_CORRECTION_PROMPT_TEMPLATE",
+    "You are cleaning transcript text for subtitles. Fix punctuation, capitalization, and obvious ASR mistakes. "
+    "Remove accidental repeated words/phrases. Preserve the original meaning and language. "
+    "Return only the corrected text.\n\nLanguage: {language}\n\nTranscript:\n{transcript}"
 )
 
 # --- Subtitles ---
@@ -262,6 +289,140 @@ def get_font_path(font_name: str) -> str:
     # If not found with extension, return as is (for system fonts)
     return os.path.join("fonts", font_name)
 
+
+def get_transcription_language_code() -> Optional[str]:
+    """Return forced ISO-639-1 code or None for auto-detect."""
+    if TRANSCRIPTION_LANGUAGE_MODE == "forced" and FORCED_LANGUAGE:
+        if FORCED_LANGUAGE not in SUPPORTED_FORCED_LANGUAGES:
+            raise ValueError(
+                f"Unsupported forced language '{FORCED_LANGUAGE}'. "
+                f"Supported values: {SUPPORTED_FORCED_LANGUAGES}"
+            )
+        return FORCED_LANGUAGE
+    return None
+
+
+def normalize_transcript_text(text: str) -> str:
+    """Clean common ASR artifacts without changing meaning."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"\s+", " ", text).strip()
+    if CLEAN_REPEATS:
+        cleaned = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(
+            r"\b([\w']+(?:\s+[\w']+){0,5})\s+\1\b",
+            r"\1",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+    if NORMALIZE_PUNCTUATION:
+        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        cleaned = re.sub(r"([,.;:!?]){2,}", r"\1", cleaned)
+        cleaned = re.sub(r"\s{2,}", " ", cleaned)
+        cleaned = cleaned.strip(" ,")
+        if cleaned and cleaned[0].isalpha():
+            cleaned = cleaned[0].upper() + cleaned[1:]
+    return cleaned.strip()
+
+
+def call_groq_text_api(prompt: str, groq_api_key: str, max_tokens: int = 256, temperature: float = 0.2) -> Optional[str]:
+    """Run a simple Groq text completion call and return plain content."""
+    import requests
+
+    if not groq_api_key or groq_api_key == "your_groq_api_key_here":
+        return None
+    headers = {
+        "Authorization": f"Bearer {groq_api_key}",
+        "Content-Type": "application/json",
+    }
+    data = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": 0.9,
+    }
+    response = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json=data,
+        timeout=60,
+    )
+    response.raise_for_status()
+    result = response.json()
+    return result["choices"][0]["message"]["content"].strip()
+
+
+def maybe_correct_text_with_llm(text: str, groq_api_key: str) -> str:
+    """Optionally run a Groq correction pass for subtitle/title text."""
+    if not text or not ENABLE_TEXT_POSTPROCESS or not LLM_TEXT_CORRECTION:
+        return text
+    try:
+        prompt = TEXT_CORRECTION_PROMPT_TEMPLATE.format(
+            language=FORCED_LANGUAGE if get_transcription_language_code() else "auto-detect",
+            transcript=text,
+        )
+        corrected = call_groq_text_api(prompt, groq_api_key, max_tokens=512, temperature=0.1)
+        return normalize_transcript_text(corrected or text)
+    except Exception as e:
+        print(f"Text correction skipped: {e}")
+        return text
+
+
+def build_clip_text(word_info: List[dict], clip: Clip, groq_api_key: str = "") -> str:
+    """Create cleaned clip transcript text for titles and logs."""
+    clip_words = [
+        w["word"] for w in word_info
+        if w["end_time"] > clip.start_time and w["start_time"] < clip.end_time
+    ]
+    text = " ".join(clip_words)
+    if ENABLE_TEXT_POSTPROCESS:
+        text = normalize_transcript_text(text)
+        text = maybe_correct_text_with_llm(text, groq_api_key)
+    return text
+
+
+def transcribe_with_faster_whisper(audio_file_path: str):
+    """Transcribe with faster-whisper and return a SimpleTranscription."""
+    try:
+        from faster_whisper import WhisperModel
+    except ImportError as e:
+        print("Transcription failed: faster-whisper is not installed.")
+        print("Install dependency or switch backend to clipsai.")
+        print(e)
+        return None
+
+    model = WhisperModel(TRANSCRIPTION_MODEL, device="cpu", compute_type="int8")
+    language_code = get_transcription_language_code()
+    if language_code:
+        print(f"Using forced transcription language: {language_code}")
+    else:
+        print("Using automatic transcription language detection.")
+
+    segments, _info = model.transcribe(
+        audio_file_path,
+        language=language_code,
+        word_timestamps=True,
+        vad_filter=True,
+    )
+    word_info: List[dict] = []
+    for segment in segments:
+        for word in segment.words or []:
+            token = (word.word or "").strip()
+            if not token:
+                continue
+            word_info.append(
+                {
+                    "word": token,
+                    "start_time": float(word.start),
+                    "end_time": float(word.end),
+                }
+            )
+    if not word_info:
+        print("No words produced by faster-whisper. Skipping this video.")
+        return None
+    return SimpleTranscription(word_info)
+
 def transcribe_with_progress(audio_file_path, transcriber):
     """Transcribe with progress tracking"""
     print('Transcribing video...')
@@ -311,11 +472,14 @@ def transcribe_with_progress(audio_file_path, transcriber):
         ]
         subprocess.run(extract_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        transcription = run_quietly(
-            transcriber.transcribe,
-            audio_file_path=temp_wav_path,
-            iso6391_lang_code='en',
-        )
+        transcribe_kwargs = {"audio_file_path": temp_wav_path}
+        language_code = get_transcription_language_code()
+        if language_code:
+            transcribe_kwargs["iso6391_lang_code"] = language_code
+            print(f"Using forced transcription language: {language_code}")
+        else:
+            print("Using automatic transcription language detection.")
+        transcription = run_quietly(transcriber.transcribe, **transcribe_kwargs)
     except IndexError:
         # whisperx may raise IndexError when VAD returns no speech segments.
         print("No active speech detected. Skipping this video.")
@@ -375,7 +539,38 @@ def trim_video_ffmpeg(
         return False
 
 
-def create_animated_subtitles(video_path, transcription, clip, output_path):
+def strip_video_metadata(input_path: str, output_path: str) -> bool:
+    """Create a copy with container metadata removed."""
+    cmd = [
+        FFMPEG_EXE,
+        "-y",
+        "-i",
+        input_path,
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-metadata",
+        "title=",
+        "-metadata",
+        "comment=",
+        "-metadata",
+        "description=",
+        output_path,
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        print(f"Metadata strip skipped: {e}")
+        return False
+
+
+def create_animated_subtitles(video_path, transcription, clip, output_path, groq_api_key: str = ""):
     """
     Create clean, bold subtitles matching the provided style: white bold for text, yellow bold for numbers/currency, no effects, TOP CENTER.
     """
@@ -433,6 +628,11 @@ def create_animated_subtitles(video_path, transcription, clip, output_path):
             'end': current_cue['end_time'],
             'text': ' '.join(current_cue['words'])
         })
+
+    if ENABLE_TEXT_POSTPROCESS:
+        for cue in cues:
+            cue["text"] = normalize_transcript_text(cue["text"])
+            cue["text"] = maybe_correct_text_with_llm(cue["text"], groq_api_key)
     
     # Determine font used and print to console
     font_used = "Montserrat Extra Bold"
@@ -496,7 +696,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         return video_path
 
 def get_viral_title(transcript_text, groq_api_key):
-    import requests
     # Limit examples to avoid too long prompt
     examples = [
         "She was almost dead 😵", "He made $1,000,000 in 1 hour 💸", "This changed everything... 😲", 
@@ -509,37 +708,11 @@ def get_viral_title(transcript_text, groq_api_key):
     if SHOW_TITLE_PROMPT:
         print("\n[Title Prompt]")
         print(prompt[:1200] + ("..." if len(prompt) > 1200 else ""))
-    headers = {
-        'Authorization': f'Bearer {groq_api_key}',
-        'Content-Type': 'application/json',
-    }
-    data = {
-        "model": "llama-3.1-8b-instant",
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "max_tokens": 30,
-        "temperature": 0.7,
-        "top_p": 0.9
-    }
     try:
-        response = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json=data
-        )
-        response.raise_for_status()
-        result = response.json()
-        # Just return the first line of the response as the title, and filter out any lines that look like explanations or quotes
-        content = result['choices'][0]['message']['content']
+        content = call_groq_text_api(prompt, groq_api_key, max_tokens=30, temperature=0.7) or ""
         lines = [l.strip('"') for l in content.strip().split('\n') if l.strip() and not l.lower().startswith('here') and not l.lower().startswith('title:')]
         title = lines[0] if lines else "Untitled Clip"
         return title
-    except requests.exceptions.HTTPError as e:
-        print(f"Error with Groq API: {e}")
-        print(f"Response status code: {response.status_code}")
-        print(f"Response text: {response.text}")
-        return "Untitled Clip"
     except Exception as e:
         print(f"Unexpected error with Groq API: {e}")
         return "Untitled Clip"
@@ -698,10 +871,15 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
     max_clips = video_max_clips[video_file]
 
     # 1. Transcribe the video (or load existing)
-    transcriber = Transcriber(model_size=os.getenv('TRANSCRIPTION_MODEL', 'large-v1'))
+    transcriber = None
+    if TRANSCRIPTION_BACKEND == "clipsai":
+        transcriber = Transcriber(model_size=os.getenv('TRANSCRIPTION_MODEL', 'large-v1'))
     transcription = load_existing_transcription(transcription_path) if transcription_file else None
     if transcription is None:
-        transcription = transcribe_with_progress(input_path, transcriber)
+        if TRANSCRIPTION_BACKEND == "faster_whisper":
+            transcription = transcribe_with_faster_whisper(input_path)
+        else:
+            transcription = transcribe_with_progress(input_path, transcriber)
         if transcription is None:
             print(f"Skipping '{video_file}' due to transcription failure or no speech.")
             skipped_videos += 1
@@ -709,17 +887,26 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
         save_transcription(transcription, transcription_path)
 
     # 2. Find clips
-    clipfinder = ClipFinder()
-    try:
-        clips = run_quietly(clipfinder.find_clips, transcription=transcription)
-    except Exception as e:
-        print(f"ClipFinder failed ({e}). Using offline fallback clip selection.")
+    if TRANSCRIPTION_BACKEND == "faster_whisper":
         clips = fallback_find_clips_from_words(
             transcription=transcription,
             min_duration=MIN_CLIP_DURATION,
             max_duration=MAX_CLIP_DURATION,
             max_candidates=max(12, max_clips * 3),
         )
+        print("Using transcript-based clip selection for faster-whisper backend.")
+    else:
+        clipfinder = ClipFinder()
+        try:
+            clips = run_quietly(clipfinder.find_clips, transcription=transcription)
+        except Exception as e:
+            print(f"ClipFinder failed ({e}). Using offline fallback clip selection.")
+            clips = fallback_find_clips_from_words(
+                transcription=transcription,
+                min_duration=MIN_CLIP_DURATION,
+                max_duration=MAX_CLIP_DURATION,
+                max_candidates=max(12, max_clips * 3),
+            )
     if not clips:
         print('No clips found in the video.')
         continue
@@ -812,17 +999,21 @@ for video_idx, (video_file, transcription_file) in enumerate(video_transcription
         output_path = resize_result.output_path
         print(f"Resize strategy used: {resize_result.strategy_used} ({resize_result.details})")
         # 6. Add styled subtitles
-        final_output = create_animated_subtitles(output_path, transcription, clip, output_path)
-        # 7. Generate viral title using Groq API
-        clip_text = " ".join([w["word"] for w in transcription.get_word_info() if w["start_time"] >= clip.start_time and w["end_time"] <= clip.end_time])
         groq_api_key = os.getenv('GROQ_API_KEY', 'your_groq_api_key_here')
+        final_output = create_animated_subtitles(output_path, transcription, clip, output_path, groq_api_key=groq_api_key)
+        # 7. Generate viral title using Groq API
+        clip_text = build_clip_text(transcription.get_word_info(), clip, groq_api_key=groq_api_key)
         title = get_viral_title(clip_text, groq_api_key)
         print(f"\nViral Title for Clip {clip_index + 1}: {title}")
         # 8. Save the final video with the viral title (keep spaces, punctuation, and emojis)
         import shutil
         viral_filename = safe_filename(title).strip() + ".mp4"
         viral_path = os.path.join(OUTPUT_DIR, viral_filename)
-        shutil.copy(final_output, viral_path)
+        sanitized_path = os.path.join(OUTPUT_DIR, f"sanitized_clip_{clip_index + 1}.mp4")
+        if strip_video_metadata(final_output, sanitized_path):
+            shutil.copy(sanitized_path, viral_path)
+        else:
+            shutil.copy(final_output, viral_path)
         print(f"Final video saved as: {viral_path}\n")
     processed_videos += 1
 

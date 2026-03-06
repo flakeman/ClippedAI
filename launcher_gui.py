@@ -1,5 +1,6 @@
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -17,6 +18,9 @@ MAIN_PY = PROJECT_DIR / "main.py"
 # Disabled by default to avoid killing long CPU-only stages.
 # Set env NO_OUTPUT_TIMEOUT_SEC > 0 only if you explicitly want watchdog kills.
 NO_OUTPUT_TIMEOUT_SEC = int(os.getenv("NO_OUTPUT_TIMEOUT_SEC", "0"))
+SUPPORTED_TRANSCRIPTION_MODELS = ["medium", "large-v1", "large-v2"]
+SUPPORTED_FORCED_LANGUAGES = ["en", "fr", "de", "es", "it", "ja", "zh", "nl", "uk", "pt"]
+SUPPORTED_TRANSCRIPTION_BACKENDS = ["clipsai", "faster_whisper"]
 
 
 class App(tk.Tk):
@@ -31,7 +35,11 @@ class App(tk.Tk):
         self.resize_mode = tk.StringVar(value="auto")
         self.max_clips = tk.IntVar(value=2)
         self.model_name = tk.StringVar(value="large-v2")
+        self.transcription_backend = tk.StringVar(value="clipsai")
         self.profile_name = tk.StringVar(value="Balanced")
+        self.language_mode = tk.StringVar(value="auto")
+        self.forced_language = tk.StringVar(value="en")
+        self.llm_correction = tk.BooleanVar(value=False)
 
         self.video_vars = {}
         self.video_paths = {}
@@ -65,8 +73,13 @@ class App(tk.Tk):
         ttk.Label(opts, text="Max clips/video").grid(row=0, column=2, sticky="w")
         ttk.Spinbox(opts, from_=1, to=12, textvariable=self.max_clips, width=6).grid(row=0, column=3, padx=6)
         ttk.Label(opts, text="Transcription model").grid(row=0, column=4, sticky="w")
-        ttk.Combobox(opts, textvariable=self.model_name, values=["medium", "large-v1", "large-v2", "large-v3"], width=12, state="readonly").grid(row=0, column=5, padx=6)
-        ttk.Button(opts, text="Scan videos", command=self._refresh_videos).grid(row=0, column=6, padx=8)
+        ttk.Combobox(opts, textvariable=self.model_name, values=SUPPORTED_TRANSCRIPTION_MODELS, width=12, state="readonly").grid(row=0, column=5, padx=6)
+        ttk.Label(opts, text="Backend").grid(row=0, column=6, sticky="w")
+        ttk.Combobox(opts, textvariable=self.transcription_backend, values=SUPPORTED_TRANSCRIPTION_BACKENDS, width=14, state="readonly").grid(row=0, column=7, padx=6)
+        ttk.Button(opts, text="Scan videos", command=self._refresh_videos).grid(row=0, column=8, padx=8)
+        ttk.Label(opts, text="Language").grid(row=1, column=3, sticky="w", pady=(8, 0))
+        ttk.Combobox(opts, textvariable=self.language_mode, values=["auto", "forced"], width=10, state="readonly").grid(row=1, column=4, padx=6, pady=(8, 0), sticky="w")
+        ttk.Entry(opts, textvariable=self.forced_language, width=8).grid(row=1, column=5, padx=6, pady=(8, 0), sticky="w")
         ttk.Label(opts, text="Profile").grid(row=1, column=0, sticky="w", pady=(8, 0))
         ttk.Combobox(
             opts,
@@ -76,6 +89,7 @@ class App(tk.Tk):
             state="readonly",
         ).grid(row=1, column=1, sticky="w", pady=(8, 0))
         ttk.Button(opts, text="Apply profile", command=self._apply_profile).grid(row=1, column=2, padx=6, pady=(8, 0), sticky="w")
+        ttk.Checkbutton(opts, text="LLM text correction", variable=self.llm_correction).grid(row=1, column=6, padx=8, pady=(8, 0), sticky="w")
 
         middle = ttk.LabelFrame(self, text="Videos")
         middle.pack(fill="both", expand=True, padx=10, pady=6)
@@ -259,6 +273,28 @@ class App(tk.Tk):
         checks.append((groq_ok, "GROQ_API_KEY configured"))
         if not hf_ok:
             ok = False
+        if self.llm_correction.get() and not groq_ok:
+            checks.append((False, "LLM text correction requires GROQ_API_KEY"))
+            ok = False
+
+        lang_mode = self.language_mode.get().strip().lower()
+        forced_lang = self.forced_language.get().strip().lower()
+        lang_ok = lang_mode in {"auto", "forced"}
+        if lang_mode == "forced":
+            lang_ok = forced_lang in SUPPORTED_FORCED_LANGUAGES
+        checks.append((lang_ok, f"language mode: {lang_mode}, forced={forced_lang or '-'}"))
+        if not lang_ok:
+            ok = False
+
+        model_ok = self.model_name.get() in SUPPORTED_TRANSCRIPTION_MODELS
+        checks.append((model_ok, f"transcription model: {self.model_name.get()}"))
+        if not model_ok:
+            ok = False
+
+        backend_ok = self.transcription_backend.get() in SUPPORTED_TRANSCRIPTION_BACKENDS
+        checks.append((backend_ok, f"transcription backend: {self.transcription_backend.get()}"))
+        if not backend_ok:
+            ok = False
 
         return ok, checks
 
@@ -306,9 +342,15 @@ class App(tk.Tk):
             return
         self._log(
             f"Start processing: {len(selected_keys)} video(s), mode={self.resize_mode.get()}, "
-            f"max_clips={int(self.max_clips.get())}, model={self.model_name.get()}, "
+            f"backend={self.transcription_backend.get()}, max_clips={int(self.max_clips.get())}, model={self.model_name.get()}, "
+            f"language_mode={self.language_mode.get()}, forced_language={self.forced_language.get().strip().lower() or '-'}, "
+            f"llm_correction={self.llm_correction.get()}, "
             f"timeout={'disabled' if NO_OUTPUT_TIMEOUT_SEC <= 0 else str(NO_OUTPUT_TIMEOUT_SEC)+'s'}."
         )
+        if self.transcription_backend.get() == "clipsai" and self.model_name.get() == "large-v2":
+            warning = "Warning: large-v2 with clipsai on CPU may take very long without visible progress."
+            self._log(warning)
+            messagebox.showwarning("Long CPU run expected", warning)
         self._log(f"Using tools: {tools_msg}")
         out_dir = Path(self.output_dir.get())
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -358,7 +400,11 @@ class App(tk.Tk):
                 env["OUTPUT_DIR"] = str(out_dir)
                 env["RESIZE_MODE"] = self.resize_mode.get()
                 env["MAX_CLIPS_OVERRIDE"] = str(int(self.max_clips.get()))
+                env["TRANSCRIPTION_BACKEND"] = self.transcription_backend.get()
                 env["TRANSCRIPTION_MODEL"] = self.model_name.get()
+                env["TRANSCRIPTION_LANGUAGE_MODE"] = self.language_mode.get().strip().lower()
+                env["FORCED_LANGUAGE"] = self.forced_language.get().strip().lower()
+                env["LLM_TEXT_CORRECTION"] = "true" if self.llm_correction.get() else "false"
 
                 cmd = [str(PYTHON_EXE), "-u", str(MAIN_PY)]
                 proc = subprocess.Popen(
